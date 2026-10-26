@@ -41,6 +41,11 @@ from .conftest import make_minimal_tiff  # noqa: E402
 # a real bug.
 ALLOWED_PARSE_EXCEPTIONS = (ValueError, TypeError)
 
+# A byte mutation can produce a structurally valid but unsupported GCP warp.
+# Keep this exception specific to mutation fuzzing; valid-by-construction
+# layouts still accept only parse errors.
+ALLOWED_MUTATION_EXCEPTIONS = (*ALLOWED_PARSE_EXCEPTIONS, NotImplementedError)
+
 # Codecs safe for round-trip on every dtype in our strategy. 'jpeg' is
 # explicitly rejected on write (see _VALID_COMPRESSIONS docstring); 'lerc' and
 # 'jpeg2000' are lossy or dtype-restricted and would need their own narrower
@@ -235,6 +240,35 @@ _CORPUS_SPECS = [
 _CORPUS = [(label, make_minimal_tiff(**kw)) for kw, label in _CORPUS_SPECS]
 
 
+def _assert_single_byte_mutation_is_typed(label, mutated):
+    """Accept a parsed raster or an expected typed refusal after mutation."""
+    try:
+        da = open_geotiff(io.BytesIO(bytes(mutated)))
+    except ALLOWED_MUTATION_EXCEPTIONS as exc:
+        if (isinstance(exc, NotImplementedError) and
+                "ground-control-point warp" not in str(exc)):
+            pytest.fail(
+                f"[{label}] single-byte mutation raised unexpected "
+                f"NotImplementedError: {exc!r}"
+            )
+        return
+    except (MemoryError, OverflowError):
+        # Header field could decode to an absurd dimension/offset. We treat
+        # these as acceptable refusals because the user gets a clear failure
+        # rather than wrong data.
+        return
+    except Exception as exc:
+        pytest.fail(
+            f"[{label}] single-byte mutation raised non-typed "
+            f"{type(exc).__name__}: {exc!r}"
+        )
+
+    # If it parsed, the result must at least be a real DataArray with the
+    # claimed dtype actually realised. Materialise to catch lazy errors.
+    assert isinstance(da, xr.DataArray)
+    _ = np.asarray(da.values)
+
+
 @pytest.mark.parametrize("label,base_tiff", _CORPUS, ids=[lab for lab, _ in _CORPUS])
 # Regression seeds for bugs surfaced by the initial Hypothesis run on
 # the le_strip_f32 corpus member (4x4 float32, 198 bytes total):
@@ -257,13 +291,15 @@ _CORPUS = [(label, make_minimal_tiff(**kw)) for kw, label in _CORPUS_SPECS]
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
 )
 def test_single_byte_mutation_typed_errors(label, base_tiff, offset_frac, new_byte):
-    """Flip one byte of a valid TIFF; reader must parse or raise typed exc.
+    """Flip one byte of a valid TIFF; reader must parse or raise a typed exc.
 
     The mutated file might still parse (the byte landed in pixel data, which
     is a valid value for that dtype). What is unacceptable is a bare
     ``IndexError`` / ``struct.error`` from reading past the buffer, or a
     segfault from the GPU/dask paths -- those are kept off this test by
-    using the eager numpy path only.
+    using the eager numpy path only. A mutation can also create a valid but
+    unsupported GCP warp, which the reader rejects with NotImplementedError;
+    that is an expected outcome for this mutation test.
     """
     mutated = bytearray(base_tiff)
     offset = int(offset_frac * len(mutated))
@@ -271,26 +307,9 @@ def test_single_byte_mutation_typed_errors(label, base_tiff, offset_frac, new_by
     if mutated[offset] == new_byte:
         new_byte = (new_byte + 1) & 0xFF
     mutated[offset] = new_byte
-
-    try:
-        da = open_geotiff(io.BytesIO(bytes(mutated)))
-    except ALLOWED_PARSE_EXCEPTIONS:
-        return
-    except (MemoryError, OverflowError):
-        # Header field could decode to an absurd dimension/offset. We treat
-        # these as acceptable refusals because the user gets a clear failure
-        # rather than wrong data.
-        return
-    except Exception as exc:
-        pytest.fail(
-            f"[{label}] single-byte mutation at offset {offset} -> {new_byte:#x} "
-            f"raised non-typed {type(exc).__name__}: {exc!r}"
-        )
-
-    # If it parsed, the result must at least be a real DataArray with the
-    # claimed dtype actually realised. Materialise to catch lazy errors.
-    assert isinstance(da, xr.DataArray)
-    _ = np.asarray(da.values)
+    _assert_single_byte_mutation_is_typed(
+        f"{label} at offset {offset} -> {new_byte:#x}", mutated
+    )
 
 
 # --- Smoke test that the module wired itself up ---
@@ -301,6 +320,17 @@ def test_corpus_baseline_parses():
         da = open_geotiff(io.BytesIO(base))
         assert isinstance(da, xr.DataArray), label
         assert da.size > 0, label
+
+
+def test_regression_non_affine_tiepoint_mutation_is_typed():
+    """The reported mutation is an expected unsupported-GCP refusal."""
+    base_tiff = dict(_CORPUS)['le_geo_f32']
+    mutated = bytearray(base_tiff)
+    assert mutated[146] == 0x06
+    mutated[146] = 0x0c
+    _assert_single_byte_mutation_is_typed(
+        'le_geo_f32 at offset 146 -> 0x0c', mutated
+    )
 
 
 # --- Targeted regressions for bugs found by the property tests above ---
